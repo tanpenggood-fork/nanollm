@@ -3,7 +3,9 @@ node_modules/
 .npm-cache/
 config.yaml
 .vscode/
+.idea/
 .test-dist/
+.nvmdrc
 dist/
 dist-sea/
 *~
