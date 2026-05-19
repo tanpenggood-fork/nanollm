@@ -1,0 +1,61 @@
+server:
+  port: 3000 # default 3000
+  ttfb_timeout: 5000 # optional, upstream first-byte timeout in ms
+  auth:
+    token: sk-123456
+
+record:
+  max_size: 100 # optional, default 10
+
+models:
+  - name: gpt-5.4-a
+    # responses规范
+    provider: openai-responses # openai-responses/openai-chat/anthropic
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY1
+    model: openai/gpt-5.4
+
+  - name: gpt-5.4-b
+    # responses规范
+    provider: openai-responses
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY1
+    model: openai/gpt-5.4
+
+  - name: glm5.1
+    # chat/completions规范
+    provider: openai-chat
+    base_url: https://example.com/v1
+    api_key: YOUR_KEY2
+    model: glm5.1
+    image: true # optional, default true; only effective for openai-chat provider
+    ttfb_timeout: 3000 # optional, overrides server.ttfb_timeout
+    proxy: http://127.0.0.1:7890 # optional, overrides HTTPS_PROXY/HTTP_PROXY for this model
+    headers:
+      user-agent: nanollm
+    body:
+      temperature: 1
+      store: false
+      text: '{"verbosity":"high"}'
+    bodyExpression: |
+      ({
+        ...body,
+        messages: body.messages?.map((message) => ({
+          ...message,
+          updatedAt: Date.now()
+        }))
+      })
+
+  - name: claude-sonnet-4-6
+    # messages规范
+    provider: anthropic
+    base_url: https://example.com/v1
+    api_key: ${YOUR_KEY3_FROM_ENV_VAR}
+    model: claude-sonnet-4-6
+    ignore_invalid_history: true # optional, default true; Anthropic转换时丢弃空signature的thinking历史
+
+fallback:
+  gpt-5.4:
+    - gpt-5.4-a
+    - gpt-5.4-b
+    - glm5.1
