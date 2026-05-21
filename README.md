@@ -280,7 +280,7 @@ npx nanollm --config /path/to/config.yaml --storage sqlite
 npx nanollm
 ```
 
-注意：npm 发布包不会包含作者本地的 `config.yaml`，需要你自己准备配置文件。
+⚠️⚠️⚠️ **注意**：npm 发布包不会包含作者本地的 `config.yaml`，需要你自己准备配置文件。
 
 
 ## Config Admin
@@ -306,3 +306,27 @@ npx nanollm
 提供了`http://localhost:3000/record`的采样记录页面，可以查看请求记录，对debug非常有用（默认只保留最新10次请求，可通过`record.max_size`配置修改）。
 
 默认情况下，上述数据都只存在内存中，进程结束即消失。使用 `--storage sqlite` 启动后，`/status` 会在 SQLite 中保留最近 1 个月的稀疏 5 分钟统计 bucket（页面仍只展示最近 6 小时），`/record` 会持久化最近 `record.max_size` 条请求记录。
+
+## 本地启动
+
+- node >= 25.5.0
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/sunwu51/nanollm.git
+cd nanollm
+
+# 2. 安装依赖
+npm install
+
+# 3. 创建配置文件（参考 Configure 章节）
+cp config-example.yaml config.yaml
+# 或手动创建 config.yaml
+
+# 4. 开发模式启动
+npm run dev
+
+# 5. 构建并运行生产版本
+npm run build
+npx nanollm --config config.yaml
+```
