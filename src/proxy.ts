@@ -34,15 +34,23 @@ export interface UpstreamTiming {
   ttfbMs: number;
 }
 
+export type OpenAIImageOperation = "generations" | "edits";
+
 // ─── Upstream URL ───────────────────────────────────────────────────────────
 
 export function getUpstreamURL(config: ModelConfig): string {
+  return getUpstreamURLForPath(config);
+}
+
+export function getUpstreamURLForPath(config: ModelConfig, imageOperation?: OpenAIImageOperation): string {
   const base = config.base_url.replace(/\/+$/, "");
   switch (config.provider) {
     case "openai-chat":
       return `${base}/chat/completions`;
     case "openai-responses":
       return `${base}/responses`;
+    case "openai-image":
+      return `${base}/images/${imageOperation ?? "generations"}`;
     case "anthropic":
       return `${base}/messages`;
     default:
@@ -56,6 +64,7 @@ function getAuthHeaders(config: ModelConfig): Record<string, string> {
   switch (config.provider) {
     case "openai-chat":
     case "openai-responses":
+    case "openai-image":
       return { Authorization: `Bearer ${config.api_key}` };
     case "anthropic":
       return {
@@ -164,6 +173,80 @@ function preparePassthroughBody(config: ModelConfig, rawBody: Record<string, unk
   );
 }
 
+function isJsonContentType(headers: Headers): boolean {
+  return headers.get("content-type")?.toLowerCase().includes("application/json") ?? false;
+}
+
+function isMultipartContentType(headers: Headers): boolean {
+  return headers.get("content-type")?.toLowerCase().includes("multipart/form-data") ?? false;
+}
+
+function prepareRawJsonBody(config: ModelConfig, body: BodyInit): { body: BodyInit; recordedRequestBody: unknown } | undefined {
+  if (typeof body !== "string" && !(body instanceof Uint8Array)) return undefined;
+
+  const text = typeof body === "string" ? body : new TextDecoder().decode(body);
+  let rawBody: unknown;
+  try {
+    rawBody = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+
+  if (!isPlainObject(rawBody)) return undefined;
+  const transformedBody = applyModelBodyTransforms(config, { ...rawBody, model: config.model });
+  return {
+    body: JSON.stringify(transformedBody),
+    recordedRequestBody: transformedBody,
+  };
+}
+
+function replaceRecordedRequestModel(recordedRequestBody: unknown, model: string): unknown {
+  return isPlainObject(recordedRequestBody) ? { ...recordedRequestBody, model } : recordedRequestBody;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function getMultipartBoundary(headers: Headers): string | undefined {
+  const contentType = headers.get("content-type") ?? "";
+  const match = /boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType);
+  return match?.[1] ?? match?.[2]?.trim();
+}
+
+function prepareRawMultipartBody(config: ModelConfig, body: BodyInit, incomingHeaders: Headers, recordedRequestBody: unknown): { body: BodyInit; recordedRequestBody: unknown } | undefined {
+  if (typeof body !== "string" && !(body instanceof Uint8Array)) return undefined;
+  const boundary = getMultipartBoundary(incomingHeaders);
+  if (!boundary) return undefined;
+
+  const text = typeof body === "string" ? body : Buffer.from(body).toString("latin1");
+  const boundaryPattern = escapeRegExp(`--${boundary}`);
+  const modelPartPattern = new RegExp(
+    `((?:^|\\r\\n)${boundaryPattern}\\r\\n(?:[^\\r\\n]+\\r\\n)*Content-Disposition: form-data; name="model"[^\\r\\n]*\\r\\n(?:[^\\r\\n]+\\r\\n)*\\r\\n)([\\s\\S]*?)(\\r\\n${boundaryPattern})`,
+  );
+  if (!modelPartPattern.test(text)) return undefined;
+  const replaced = text.replace(modelPartPattern, `$1${config.model}$3`);
+  return {
+    body: typeof body === "string" ? replaced : Buffer.from(replaced, "latin1"),
+    recordedRequestBody: replaceRecordedRequestModel(recordedRequestBody, config.model),
+  };
+}
+
+async function prepareRawBody(
+  config: ModelConfig,
+  body: BodyInit,
+  incomingHeaders: Headers,
+  recordedRequestBody: unknown,
+): Promise<{ body: BodyInit; recordedRequestBody: unknown } | undefined> {
+  if (isJsonContentType(incomingHeaders)) {
+    return prepareRawJsonBody(config, body);
+  }
+  if (isMultipartContentType(incomingHeaders)) {
+    return prepareRawMultipartBody(config, body, incomingHeaders, recordedRequestBody);
+  }
+  return undefined;
+}
+
 // ─── Normalize Response ─────────────────────────────────────────────────────
 
 function normalizeUpstreamResponse(provider: StreamFormat, body: unknown): NormalizedResponse {
@@ -198,7 +281,18 @@ async function upstreamFetch(
   stream: boolean,
   options?: UpstreamRequestOptions,
 ): Promise<{ response: Response; timing: UpstreamTiming }> {
-  const url = getUpstreamURL(config);
+  return upstreamFetchToUrl(config, getUpstreamURL(config), body, stream, getForwardHeaders(config, options), options);
+}
+
+async function upstreamFetchToUrl(
+  config: ModelConfig,
+  url: string,
+  body: BodyInit,
+  stream: boolean,
+  headers: HeadersInit,
+  options?: UpstreamRequestOptions,
+  recordedRequestBody: unknown = typeof body === "string" ? body : "[binary body]",
+): Promise<{ response: Response; timing: UpstreamTiming }> {
   const proxyUrl = resolveProxyUrl(config);
   const timeoutMs = config.ttfb_timeout;
   const abortController = timeoutMs !== undefined ? new AbortController() : undefined;
@@ -207,7 +301,7 @@ async function upstreamFetch(
 
   const fetchOptions: RequestInit = {
     method: "POST",
-    headers: getForwardHeaders(config, options),
+    headers,
     body,
     ...(abortController ? { signal: abortController.signal } : {}),
   };
@@ -217,7 +311,7 @@ async function upstreamFetch(
     modelName: options?.modelName ?? config.name,
     url,
     requestHeaders: fetchOptions.headers as Record<string, string>,
-    requestBody: body,
+    requestBody: recordedRequestBody,
   });
 
   if (proxyUrl) {
@@ -383,7 +477,7 @@ async function validateStreamContent(
       const text = decoder.decode(value, { stream: true });
       const events = sseParser.push(text);
 
-      if (events.length > 0) {
+      if (events.length > 0 || sseParser.hasBufferedRealData()) {
         return reconstructStream(bufferedChunks, reader);
       }
 
@@ -407,6 +501,67 @@ async function validateStreamContent(
     if (error instanceof Error && "upstream" in error) throw error;
     throw error;
   }
+}
+
+function getRawForwardHeaders(
+  config: ModelConfig,
+  incomingHeaders: Headers,
+  options?: UpstreamRequestOptions,
+): Record<string, string> {
+  const headers: Record<string, string> = {};
+  const skipped = new Set([
+    "authorization",
+    "cookie",
+    "host",
+    "content-length",
+    "connection",
+    "accept-encoding",
+  ]);
+  for (const [key, value] of incomingHeaders.entries()) {
+    if (skipped.has(key.toLowerCase())) continue;
+    headers[key] = value;
+  }
+  return {
+    ...headers,
+    ...getAuthHeaders(config),
+    ...(options?.userAgent ? { "User-Agent": options.userAgent } : {}),
+    ...(config.headers ?? {}),
+  };
+}
+
+export async function passthroughRawRequest(
+  config: ModelConfig,
+  body: BodyInit,
+  incomingHeaders: Headers,
+  options?: UpstreamRequestOptions & { imageOperation?: OpenAIImageOperation; recordedRequestBody?: unknown },
+): Promise<{ body: unknown; responseText: string; headers: Headers; status: number; timing: UpstreamTiming }> {
+  const url = getUpstreamURLForPath(config, options?.imageOperation);
+  const headers = getRawForwardHeaders(config, incomingHeaders, options);
+  const preparedBody = await prepareRawBody(config, body, incomingHeaders, options?.recordedRequestBody);
+  const upstreamBody = preparedBody?.body ?? body;
+  const recordedRequestBody = preparedBody?.recordedRequestBody ?? options?.recordedRequestBody;
+  const { response, timing } = await upstreamFetchToUrl(
+    config,
+    url,
+    upstreamBody,
+    false,
+    headers,
+    options,
+    recordedRequestBody,
+  );
+  const responseText = await response.text();
+  setRecordedAttemptResponseBody({ index: options?.attemptIndex ?? 0, body: responseText });
+  let responseBody: unknown = responseText;
+  try {
+    responseBody = JSON.parse(responseText);
+  } catch {}
+  return {
+    body: responseBody,
+    responseText,
+    headers: response.headers,
+    status: response.status,
+    timing,
+  };
 }
 
 // ─── Passthrough (same format, no conversion) ───────────────────────────────

@@ -7,7 +7,7 @@ import { isResponsesCustomToolName, } from "../request-context.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type StreamFormat = "openai-chat" | "openai-responses" | "anthropic";
+export type StreamFormat = "openai-chat" | "openai-responses" | "anthropic" | "openai-image";
 
 export type NormalizedStreamEvent =
   | { type: "start"; id: string; model: string; createdAt: number }
@@ -26,6 +26,31 @@ type ParsedSSE = { event?: string; data: string };
 
 export class SSEParser {
   private buffer = "";
+
+  hasBufferedRealData(): boolean {
+    if (!this.buffer.trim()) return false;
+
+    const parts = this.buffer.split(/\r?\n\r?\n/);
+    const pending = parts[parts.length - 1] || "";
+    if (!pending.trim()) return false;
+
+    let event: string | undefined;
+    for (const line of pending.split(/\r?\n/)) {
+      if (line.startsWith("event:")) {
+        event = line.slice(6).trim();
+        continue;
+      }
+
+      if (!line.startsWith("data:")) continue;
+      if (event === "ping") continue;
+
+      const data = line.slice(5).trimStart();
+      if (!data || "[DONE]".startsWith(data) || data === "[DONE]") continue;
+      return true;
+    }
+
+    return false;
+  }
 
   push(chunk: string): ParsedSSE[] {
     this.buffer += chunk;

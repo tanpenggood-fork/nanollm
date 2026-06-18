@@ -231,7 +231,19 @@ function denormalizeOpenAIChatMessages(messages: NormalizedMessage[], imageEnabl
   }
 
   const merged: any[] = [];
+  const pendingToolResultMedia: any[] = [];
+  const flushToolResultMedia = () => {
+    if (pendingToolResultMedia.length === 0) return;
+    merged.push({ role: "user", content: pendingToolResultMedia.splice(0) });
+  };
   for (const message of denormalized) {
+    if (message?.__toolResultMedia) {
+      pendingToolResultMedia.push(...(Array.isArray(message.content) ? message.content : []));
+      continue;
+    }
+    if (pendingToolResultMedia.length > 0 && message?.role !== "tool") {
+      flushToolResultMedia();
+    }
     const previous = merged.at(-1);
     if (previous?.role === "assistant" && message?.role === "assistant") {
       if (previous.content === null && message.content !== null) {
@@ -286,6 +298,7 @@ function denormalizeOpenAIChatMessages(messages: NormalizedMessage[], imageEnabl
     }
     merged.push(message);
   }
+  flushToolResultMedia();
   return merged;
 }
 
@@ -379,12 +392,25 @@ function normalizeOpenAIChatMessage(message: any): NormalizedMessage[] {
     case "assistant":
       return [{ role: "assistant", parts: normalizeOpenAIChatAssistantParts(message), toolCalls: [...(message.tool_calls?.map((toolCall: any) => normalizeOpenAIChatToolCall(toolCall)) ?? []), ...(message.function_call ? [{ kind: "function", id: `${message.function_call.name}:legacy`, name: message.function_call.name, payload: message.function_call.arguments }] : [])] }];
     case "tool":
-      return [{ role: "tool", toolCallId: message.tool_call_id, parts: [text(typeof message.content === "string" ? message.content : message.content.map((part: any) => part.text).join("\n"))] }];
+      return [{ role: "tool", toolCallId: message.tool_call_id, parts: normalizeOpenAIChatToolResultParts(message.content) }];
     case "function":
       return [{ role: "function", name: message.name, parts: message.content ? [text(message.content)] : [] }];
     default:
       fail(`Unsupported chat role "${message.role}"`);
   }
+}
+
+function normalizeOpenAIChatToolResultParts(content: any): NormalizedMessage["parts"] {
+  if (typeof content === "string") return [text(content)];
+  return content.map((part: any) => {
+    if (part.type === "text") return text(part.text);
+    if (part.type === "image_url") return { type: "image_url", url: part.image_url.url, detail: part.image_url.detail };
+    if (part.type === "input_audio") return { type: "input_audio", data: part.input_audio.data, format: part.input_audio.format };
+    if (part.type === "document_url") return { type: "document_url", url: part.document_url.url, title: part.document_url.title ?? null };
+    if (part.type === "document_base64") return { type: "document_base64", data: part.document_base64.data, mediaType: part.document_base64.media_type ?? null, title: part.document_base64.title ?? null };
+    if (part.type === "refusal") return refusal(part.refusal);
+    fail(`Unsupported chat tool content part "${part.type}"`);
+  });
 }
 
 function normalizeOpenAIChatUserParts(content: any): NormalizedMessage["parts"] {
@@ -760,7 +786,20 @@ function denormalizeOpenAIChatToolResultMessage(message: NormalizedMessage, iden
   }
 
   if (imageEnabled && message.parts.some((part) => part.type === "image_url")) {
-    return [{ role: "user", content: [{ type: "text", text: `Tool result for ${identifier}` }, ...message.parts.map((part) => denormalizeOpenAIChatUserPart(part, true))] }];
+    const textContent = message.parts
+      .filter((part) => part.type === "text" || part.type === "refusal")
+      .map((part) => (part as { type: "text" | "refusal"; text: string }).text)
+      .join("\n");
+    const toolContent = textContent || "[multimedia tool result returned separately]";
+    const imageContent = message.parts
+      .filter((part) => part.type === "image_url")
+      .map((part) => denormalizeOpenAIChatUserPart(part, true));
+    return [
+      legacyFunctionName
+        ? { role: "function", name: legacyFunctionName, content: toolContent }
+        : { role: "tool", tool_call_id: message.toolCallId ?? "", content: toolContent },
+      ...(imageContent.length > 0 ? [{ role: "user", content: imageContent, __toolResultMedia: true }] : []),
+    ];
   }
   // image=false fallback: keep tool/function role, drop multimedia content to avoid
   // huge base64 data URLs inflating context and breaking strict API role gateways.

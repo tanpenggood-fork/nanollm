@@ -27,7 +27,7 @@ import { renderAdminConfigPage } from "../src/admin-config-page.js";
 import { ConfigManager } from "../src/config-manager.js";
 import { FallbackFailureTracker, FALLBACK_FAILURE_WINDOW_MS, sortFallbackGroupMembers } from "../src/fallback.js";
 import { getHTTPLogLevel, shouldEmitLog } from "../src/http-log.js";
-import { forwardRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
+import { forwardRequest, passthroughRawRequest, passthroughRequest, passthroughStreamRequest, resolveProxyUrl } from "../src/proxy.js";
 import { renderRecordPage } from "../src/record-page.js";
 import { renderStatusPage } from "../src/status-page.js";
 import { handleServerStartupError } from "../src/startup-error.js";
@@ -152,6 +152,7 @@ function buildAuthTestApp(token?: string) {
   app.get("/health", (c) => c.json({ ok: true }));
   app.get("/status", (c) => c.text("status-page"));
   app.get("/record", (c) => c.text("record-page"));
+  app.post("/record/:requestId/replay", (c) => c.json({ ok: true, requestId: c.req.param("requestId") }));
   app.get("/admin", (c) => c.text("admin-page"));
   app.get("/v1/models", (c) => c.json({ object: "list", data: [] }));
   return app;
@@ -164,6 +165,24 @@ async function waitForCondition(check: () => boolean, timeoutMs = 3000, interval
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
   }
   throw new Error(`Condition not met within ${timeoutMs}ms`);
+}
+
+async function readStreamText(body: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = body.getReader();
+  const chunks: string[] = [];
+  const decoder = new TextDecoder();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(decoder.decode(value, { stream: true }));
+    }
+    const tail = decoder.decode();
+    if (tail) chunks.push(tail);
+  } finally {
+    reader.releaseLock();
+  }
+  return chunks.join("");
 }
 
 function parseSSEObjects(chunks: string[]): Array<{ event?: string; data: any }> {
@@ -571,6 +590,73 @@ run("responses file tool output becomes anthropic document tool_result block", (
   assert.equal(toolResult.content[0].type, "document");
   assert.equal(toolResult.content[0].title, "tool.pdf");
   assert.equal(toolResult.content[0].source?.url, "https://example.com/tool.pdf");
+});
+
+run("responses text image tool output becomes anthropic mixed tool_result block", () => {
+  const result = responsesRequestToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    input: [
+      {
+        type: "function_call_output",
+        call_id: "call_img",
+        output: [
+          { type: "input_text", text: "caption" },
+          { type: "input_image", image_url: "https://example.com/tool.png" },
+        ],
+      },
+    ],
+  } as any);
+
+  const toolResult = (result.messages[0].content as Array<{ type: string; content: Array<{ type: string; text?: string; source?: { url?: string } }> }>)[0];
+  assert.equal(toolResult.type, "tool_result");
+  assert.deepEqual(toolResult.content.map((part) => part.type), ["text", "image"]);
+  assert.equal(toolResult.content[0].text, "caption");
+  assert.equal(toolResult.content[1].source?.url, "https://example.com/tool.png");
+});
+
+run("chat tool message with image content preserves image when converting to responses", () => {
+  const responses = chatParamsToResponsesRequest({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "tool",
+        tool_call_id: "call_img",
+        content: [
+          { type: "text", text: "tool result text" },
+          { type: "image_url", image_url: { url: "https://example.com/tool.png" } },
+        ],
+      },
+    ],
+  } as any);
+
+  const output = (responses.input as Array<{ type: string; output?: Array<{ type: string; text?: string; image_url?: string }> }>)[0];
+  assert.equal(output.type, "function_call_output");
+  assert.equal(output.output?.[0].type, "input_text");
+  assert.equal(output.output?.[0].text, "tool result text");
+  assert.equal(output.output?.[1].type, "input_image");
+  assert.equal(output.output?.[1].image_url, "https://example.com/tool.png");
+});
+
+run("chat tool message with image content becomes anthropic tool_result block", () => {
+  const anthropic = chatParamsToAnthropicMessageRequest({
+    model: "gpt-4o-mini",
+    messages: [
+      {
+        role: "tool",
+        tool_call_id: "call_img",
+        content: [
+          { type: "text", text: "tool result text" },
+          { type: "image_url", image_url: { url: "https://example.com/tool.png" } },
+        ],
+      },
+    ],
+  } as any);
+
+  const toolResult = (anthropic.messages[0].content as Array<{ type: string; content: Array<{ type: string; text?: string; source?: { url?: string } }> }>)[0];
+  assert.equal(toolResult.type, "tool_result");
+  assert.deepEqual(toolResult.content.map((part) => part.type), ["text", "image"]);
+  assert.equal(toolResult.content[0].text, "tool result text");
+  assert.equal(toolResult.content[1].source?.url, "https://example.com/tool.png");
 });
 
 run("string content survives chat to responses to chat", () => {
@@ -1640,7 +1726,7 @@ run("anthropic tool_result block array becomes chat tool text", () => {
   assert.equal((result.messages[0] as { content: string }).content, "Sunny\n25C");
 });
 
-run("anthropic image tool_result becomes chat user multimodal fallback when image is enabled", () => {
+run("anthropic image tool_result keeps chat tool result when image is enabled", () => {
   const result = anthropicMessageRequestToChatParams({
     model: "claude-sonnet-4-5",
     max_tokens: 1024,
@@ -1663,12 +1749,53 @@ run("anthropic image tool_result becomes chat user multimodal fallback when imag
     ],
   } as any);
 
-  const fallback = result.messages[1] as { role: string; content: Array<{ type: string; text?: string; image_url?: { url?: string } }> };
-  assert.equal(fallback.role, "user");
-  assert.equal(fallback.content[0].type, "text");
-  assert.match(fallback.content[0].text ?? "", /Tool result for call_img/);
-  assert.equal(fallback.content[1].type, "image_url");
-  assert.equal(fallback.content[1].image_url?.url, "https://example.com/tool.png");
+  const tool = result.messages[1] as { role: string; tool_call_id: string; content: string };
+  assert.equal(tool.role, "tool");
+  assert.equal(tool.tool_call_id, "call_img");
+  assert.equal(tool.content, "[multimedia tool result returned separately]");
+
+  const image = result.messages[2] as { role: string; content: Array<{ type: string; image_url?: { url?: string } }> };
+  assert.equal(image.role, "user");
+  assert.equal(image.content.length, 1);
+  assert.equal(image.content[0].type, "image_url");
+  assert.equal(image.content[0].image_url?.url, "https://example.com/tool.png");
+});
+
+run("anthropic text image tool_result keeps text only in chat tool result", () => {
+  const result = anthropicMessageRequestToChatParams({
+    model: "claude-sonnet-4-5",
+    max_tokens: 1024,
+    image: true,
+    messages: [
+      {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "call_img", caller: { type: "direct" }, name: "view_image", input: { path: "/tmp/a.png" } }],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result",
+            tool_use_id: "call_img",
+            content: [
+              { type: "text", text: "caption" },
+              { type: "image", source: { type: "url", url: "https://example.com/tool.png" } },
+            ],
+          },
+        ],
+      },
+    ],
+  } as any);
+
+  const tool = result.messages[1] as { role: string; tool_call_id: string; content: string };
+  assert.equal(tool.role, "tool");
+  assert.equal(tool.tool_call_id, "call_img");
+  assert.equal(tool.content, "caption");
+
+  const image = result.messages[2] as { role: string; content: Array<{ type: string; text?: string; image_url?: { url?: string } }> };
+  assert.equal(image.role, "user");
+  assert.deepEqual(image.content.map((part) => part.type), ["image_url"]);
+  assert.equal(image.content[0].image_url?.url, "https://example.com/tool.png");
 });
 
 run("anthropic image tool_result stays chat tool string fallback when image is disabled", () => {
@@ -2343,6 +2470,45 @@ run("chat image=true merges consecutive assistants with tool calls into one", ()
   assert.equal(assistant.tool_calls.length, 2);
   assert.equal(chat.messages[1].role, "tool");
   assert.equal(chat.messages[2].role, "tool");
+});
+
+run("chat image=true keeps multiple tool outputs before tool-result media", () => {
+  const chat = responsesRequestToChatParams({
+    model: "gpt-5",
+    image: true,
+    input: [
+      { type: "function_call", call_id: "call_a", name: "foo", arguments: "{}" },
+      { type: "function_call", call_id: "call_b", name: "bar", arguments: "{}" },
+      {
+        type: "function_call_output",
+        call_id: "call_a",
+        output: [
+          { type: "input_text", text: "res_a" },
+          { type: "input_image", image_url: "https://example.com/a.png" },
+        ],
+      },
+      {
+        type: "function_call_output",
+        call_id: "call_b",
+        output: [
+          { type: "input_text", text: "res_b" },
+          { type: "input_image", image_url: "https://example.com/b.png" },
+        ],
+      },
+    ],
+  } as any);
+
+  assert.equal(chat.messages.length, 4);
+  assert.equal(chat.messages[0].role, "assistant");
+  assert.equal(chat.messages[1].role, "tool");
+  assert.equal((chat.messages[1] as any).tool_call_id, "call_a");
+  assert.equal((chat.messages[1] as any).content, "res_a");
+  assert.equal(chat.messages[2].role, "tool");
+  assert.equal((chat.messages[2] as any).tool_call_id, "call_b");
+  assert.equal((chat.messages[2] as any).content, "res_b");
+  assert.equal(chat.messages[3].role, "user");
+  assert.deepEqual((chat.messages[3] as any).content.map((part: any) => part.image_url?.url), ["https://example.com/a.png", "https://example.com/b.png"]);
+  assert.equal((chat.messages[3] as any).__toolResultMedia, undefined);
 });
 
 run("responses anthropic conversion batches consecutive assistants with tool calls", () => {
@@ -3027,6 +3193,58 @@ fallback:
   }
 });
 
+run("config accepts openai-image provider", () => {
+  const configPath = writeTempConfig(`
+models:
+  - name: gpt-image-1
+    provider: openai-image
+    base_url: https://api.openai.com/v1
+    api_key: test-key
+    model: gpt-image-1
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.equal(config.models[0].provider, "openai-image");
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
+run("openai-image provider uses fixed default ttfb_timeout instead of server default", () => {
+  const configPath = writeTempConfig(`
+server:
+  ttfb_timeout: 1500
+
+models:
+  - name: image-default
+    provider: openai-image
+    base_url: https://api.openai.com/v1
+    api_key: test-key
+    model: gpt-image-1
+  - name: image-override
+    provider: openai-image
+    base_url: https://api.openai.com/v1
+    api_key: test-key
+    model: gpt-image-1
+    ttfb_timeout: 120000
+  - name: chat-default
+    provider: openai-chat
+    base_url: https://api.openai.com/v1
+    api_key: test-key
+    model: gpt-4.1
+`);
+
+  try {
+    const config = loadConfig(configPath);
+    assert.equal(config.models[0].ttfb_timeout, 600000);
+    assert.equal(config.models[1].ttfb_timeout, 120000);
+    assert.equal(config.models[2].ttfb_timeout, 1500);
+  } finally {
+    rmSync(dirname(configPath), { recursive: true, force: true });
+  }
+});
+
 run("config manager does not hot-apply auth token when enabling it from empty", () => {
   const configPath = writeTempConfig(`
 server:
@@ -3233,6 +3451,42 @@ await runAsync("stream request only enforces ttfb_timeout until response starts"
     }
 
     assert.equal(chunks.join(""), "data: first\n\ndata: done\n\n");
+  });
+});
+
+await runAsync("stream validation accepts large incomplete responses created event", async () => {
+  const largeInstructions = "x".repeat(96 * 1024);
+  const firstEvent = `event: response.created\ndata: ${JSON.stringify({
+    type: "response.created",
+    response: {
+      id: "resp_large",
+      object: "response",
+      created_at: 1,
+      status: "in_progress",
+      instructions: largeInstructions,
+    },
+  })}`;
+  const tail = "\n\nevent: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n";
+
+  await withHTTPServer(async (_req, res) => {
+    res.writeHead(200, { "Content-Type": "text/event-stream" });
+    res.write(firstEvent.slice(0, 70 * 1024));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    res.end(firstEvent.slice(70 * 1024) + tail);
+  }, async (baseURL) => {
+    const result = await passthroughStreamRequest({
+      name: "alpha",
+      provider: "openai-responses",
+      base_url: baseURL,
+      api_key: "test-key",
+      model: "upstream-alpha",
+    }, {
+      model: "alpha",
+      input: "hello",
+      stream: true,
+    });
+
+    assert.equal(await readStreamText(result.body), firstEvent + tail);
   });
 });
 
@@ -3494,21 +3748,26 @@ run("sqlite status store persists sparse buckets for a month while UI series sta
   const dir = mkdtempSync(join(os.tmpdir(), "nanollm-sqlite-status-"));
   const db = new DatabaseSync(join(dir, "status.sqlite3"));
   try {
-    const now = Date.UTC(2026, 3, 30, 12, 0, 0);
-    const visibleBucket = now - 5 * 60 * 1000;
-    const retainedButHidden = now - 7 * 60 * 60 * 1000;
-    const expired = now - 31 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const fiveMinutesMs = 5 * 60 * 1000;
+    const floorBucket = (timestamp: number) => Math.floor(timestamp / fiveMinutesMs) * fiveMinutesMs;
+    const visibleTimestamp = now - 5 * 60 * 1000;
+    const retainedButHiddenTimestamp = now - 7 * 60 * 60 * 1000;
+    const expiredTimestamp = now - 31 * 24 * 60 * 60 * 1000;
+    const visibleBucket = floorBucket(visibleTimestamp);
+    const retainedButHidden = floorBucket(retainedButHiddenTimestamp);
+    const expired = floorBucket(expiredTimestamp);
     const store = new SqliteStatusStore(db);
 
-    store.recordAttempt("alpha", visibleBucket);
+    store.recordAttempt("alpha", visibleTimestamp);
     store.recordSuccess("alpha", 120, 40, {
       nonCacheInputTokens: 1200,
       cacheReadInputTokens: 300,
       outputTokens: 450,
-    }, visibleBucket, 9000);
-    store.recordAttempt("alpha", retainedButHidden);
-    store.recordSuccess("alpha", 200, 50, undefined, retainedButHidden);
-    store.recordAttempt("alpha", expired);
+    }, visibleTimestamp, 9000);
+    store.recordAttempt("alpha", retainedButHiddenTimestamp);
+    store.recordSuccess("alpha", 200, 50, undefined, retainedButHiddenTimestamp);
+    store.recordAttempt("alpha", expiredTimestamp);
 
     const restarted = new SqliteStatusStore(db);
     const visibleCell = restarted.getModelSeries("alpha", now).find((cell) => cell.bucketStart === visibleBucket);
@@ -3779,6 +4038,11 @@ run("record page renders query UI and JSON tree viewer", () => {
   assert.match(html, /renderStreamBody/);
   assert.match(html, /createCopyButton/);
   assert.match(html, /复制合并 JSON/);
+  assert.match(html, /createReplayControls/);
+  assert.match(html, /\/record\/" \+ encodeURIComponent\(record\.requestId\) \+ "\/replay"/);
+  assert.match(html, /Sensitive client headers are not replayed; provider auth uses current config\./);
+  assert.match(html, /Replay disabled while in progress/);
+  assert.match(html, /Replay created new record/);
   assert.match(html, /renderStreamValue\(streamState\.reconstructed, \{ expandedDepth: 1 \}\)/);
   assert.match(html, /box-actions/);
   assert.match(html, /setInterval\(\(\) =>/);
@@ -3921,7 +4185,7 @@ await runAsync("auth middleware leaves routes open when token is not configured"
 
 await runAsync("auth middleware rejects unauthenticated requests when token is configured", async () => {
   const app = buildAuthTestApp("top-secret");
-  for (const path of ["/v1/models", "/admin", "/status", "/record"]) {
+  for (const path of ["/v1/models", "/admin", "/status", "/record", "/record/abcdef/replay"]) {
     const response = await app.request("http://localhost" + path);
     assert.equal(response.status, 401);
     assert.equal(response.headers.get("www-authenticate"), "Bearer");
@@ -3950,6 +4214,13 @@ await runAsync("auth middleware accepts bearer header, query token, and options 
     headers: { Cookie: "nanollm_auth=top-secret" },
   });
   assert.equal(cookieResponse.status, 200);
+
+  const replayResponse = await app.request("http://localhost/record/abcdef/replay", {
+    method: "POST",
+    headers: { Cookie: "nanollm_auth=top-secret" },
+  });
+  assert.equal(replayResponse.status, 200);
+  assert.deepEqual(await replayResponse.json(), { ok: true, requestId: "abcdef" });
 
   const optionsResponse = await app.request("http://localhost/v1/models", { method: "OPTIONS" });
   assert.notEqual(optionsResponse.status, 401);
@@ -4023,6 +4294,133 @@ await runAsync("passthrough request records upstream request and response", asyn
   assert.equal(record?.attempts[0].request.headers?.Authorization, "[REDACTED]");
   assert.deepEqual(record?.attempts[0].response.body, { id: "resp_1", usage: { prompt_tokens: 3, completion_tokens: 2 } });
   assert.deepEqual(record?.clientResponse.body, { id: "resp_1", usage: { prompt_tokens: 3, completion_tokens: 2 } });
+  stopRecording();
+});
+
+await runAsync("openai-image raw json generation request uses configured upstream model", async () => {
+  startRecording();
+  const requestId = "22345678-1234-5678-9abc-def012345678";
+  let upstreamPath = "";
+  let upstreamBody = "";
+  let upstreamContentType = "";
+  await withHTTPServer(async (req, res) => {
+    upstreamPath = req.url ?? "";
+    upstreamContentType = req.headers["content-type"] ?? "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => {
+      upstreamBody += chunk;
+    });
+    req.on("end", () => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ created: 1, data: [{ b64_json: "abc" }] }));
+    });
+  }, async (baseURL) => {
+    const rawBody = JSON.stringify({ model: "public-image", prompt: "draw a cat", size: "1024x1024" });
+    await runWithRequestId(requestId, async () => {
+      beginRecordedRequest({
+        requestId,
+        path: "/v1/images/generations",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.parse(rawBody),
+        stream: false,
+      });
+      const result = await passthroughRawRequest({
+        name: "public-image",
+        provider: "openai-image",
+        base_url: baseURL,
+        api_key: "test-key",
+        model: "upstream-image",
+      }, new TextEncoder().encode(rawBody), new Headers({ "Content-Type": "application/json" }), {
+        attemptIndex: 1,
+        modelName: "public-image",
+        imageOperation: "generations",
+        recordedRequestBody: JSON.parse(rawBody),
+      });
+      setRecordedClientResponseMeta({ requestId, status: 200, headers: result.headers });
+      setRecordedClientResponseBody({ requestId, body: result.body });
+    });
+  });
+
+  assert.equal(upstreamPath, "/images/generations");
+  assert.equal(upstreamContentType, "application/json");
+  assert.equal(upstreamBody, JSON.stringify({ model: "upstream-image", prompt: "draw a cat", size: "1024x1024" }));
+  const record = getRecordedRequest(requestId);
+  assert.ok(record);
+  assert.equal(record?.attempts[0].provider, "openai-image");
+  assert.deepEqual(record?.attempts[0].request.body, { model: "upstream-image", prompt: "draw a cat", size: "1024x1024" });
+  assert.deepEqual(record?.attempts[0].response.body, { created: 1, data: [{ b64_json: "abc" }] });
+  assert.deepEqual(record?.clientResponse.body, { created: 1, data: [{ b64_json: "abc" }] });
+  stopRecording();
+});
+
+await runAsync("openai-image raw multipart edit request uses configured upstream model", async () => {
+  startRecording();
+  const requestId = "22345678-1234-5678-9abc-def012345679";
+  let upstreamPath = "";
+  let upstreamModel = "";
+  let upstreamPrompt = "";
+  let upstreamFileName = "";
+  let upstreamContentType = "";
+  await withHTTPServer(async (req, res) => {
+    upstreamPath = req.url ?? "";
+    upstreamContentType = req.headers["content-type"] ?? "";
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    }
+    const request = new Request("http://localhost", {
+      method: "POST",
+      headers: req.headers as HeadersInit,
+      body: Buffer.concat(chunks),
+    });
+    const formData = await request.formData();
+    upstreamModel = String(formData.get("model"));
+    upstreamPrompt = String(formData.get("prompt"));
+    const image = formData.get("image");
+    upstreamFileName = image instanceof File ? image.name : "";
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ created: 1, data: [{ b64_json: "edit" }] }));
+  }, async (baseURL) => {
+    const formData = new FormData();
+    formData.set("model", "public-image");
+    formData.set("prompt", "edit a cat");
+    formData.set("image", new Blob(["image-bytes"], { type: "image/png" }), "cat.png");
+    const request = new Request("http://localhost", { method: "POST", body: formData });
+    const rawBody = new Uint8Array(await request.arrayBuffer());
+    const contentType = request.headers.get("content-type") ?? "";
+    await runWithRequestId(requestId, async () => {
+      beginRecordedRequest({
+        requestId,
+        path: "/v1/images/edits",
+        headers: { "Content-Type": contentType },
+        body: { model: "public-image", prompt: "edit a cat", image: { type: "file", name: "cat.png", mediaType: "image/png", size: 11 } },
+        stream: false,
+      });
+      const result = await passthroughRawRequest({
+        name: "public-image",
+        provider: "openai-image",
+        base_url: baseURL,
+        api_key: "test-key",
+        model: "upstream-image",
+      }, rawBody, new Headers({ "Content-Type": contentType }), {
+        attemptIndex: 1,
+        modelName: "public-image",
+        imageOperation: "edits",
+        recordedRequestBody: { model: "public-image", prompt: "edit a cat", image: { type: "file", name: "cat.png", mediaType: "image/png", size: 11 } },
+      });
+      setRecordedClientResponseMeta({ requestId, status: 200, headers: result.headers });
+      setRecordedClientResponseBody({ requestId, body: result.body });
+    });
+  });
+
+  assert.equal(upstreamPath, "/images/edits");
+  assert.match(upstreamContentType, /^multipart\/form-data; boundary=/);
+  assert.equal(upstreamModel, "upstream-image");
+  assert.equal(upstreamPrompt, "edit a cat");
+  assert.equal(upstreamFileName, "cat.png");
+  const record = getRecordedRequest(requestId);
+  assert.ok(record);
+  assert.deepEqual(record?.attempts[0].request.body, { model: "upstream-image", prompt: "edit a cat", image: { type: "file", name: "cat.png", mediaType: "image/png", size: 11 } });
   stopRecording();
 });
 
